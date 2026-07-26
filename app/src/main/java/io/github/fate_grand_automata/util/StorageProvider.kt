@@ -4,6 +4,8 @@ import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Environment
+import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.github.fate_grand_automata.BuildConfig
@@ -14,6 +16,7 @@ import io.github.fate_grand_automata.scripts.enums.GameServer
 import io.github.lib_automata.Pattern
 import timber.log.Timber
 import java.io.File
+import java.io.FileInputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.text.SimpleDateFormat
@@ -21,6 +24,32 @@ import java.util.Date
 import java.util.Locale
 import javax.inject.Inject
 import javax.inject.Singleton
+
+/**
+ * Waydroid's ExternalStorageProvider proxies reads through MediaProvider, which throws a
+ * NullPointerException resolving the calling package identity in this environment - a platform
+ * bug, not something fixable from the SAF/ContentResolver side. When we have full storage access
+ * (MANAGE_EXTERNAL_STORAGE), resolve "primary" volume tree/document URIs to a real file path and
+ * read directly, skipping SAF/MediaProvider entirely.
+ */
+private fun Uri.toRealFileOrNull(): File? {
+    if (!Environment.isExternalStorageManager()) return null
+
+    val docId = try {
+        if (DocumentsContract.isTreeUri(this))
+            DocumentsContract.getTreeDocumentId(this)
+        else
+            DocumentsContract.getDocumentId(this)
+    } catch (e: Exception) {
+        return null
+    }
+
+    val split = docId.split(":", limit = 2)
+    if (split.size != 2 || !split[0].equals("primary", ignoreCase = true)) return null
+
+    val file = File(Environment.getExternalStorageDirectory(), split[1])
+    return file.takeIf { it.exists() }
+}
 
 @Singleton
 class StorageProvider @Inject constructor(
@@ -39,6 +68,12 @@ class StorageProvider @Inject constructor(
 
     val resolver: ContentResolver = context.contentResolver
     private var dirRoot: DocumentFile? = null
+
+    // Direct filesystem path for dirRoot, when resolvable (see toRealFileOrNull). Used to bypass
+    // SAF/DocumentFile entirely for support image lookup, since Waydroid's URI-grant persistence
+    // is broken system-wide (dumpsys uri_grants comes back empty for every app), which makes every
+    // DocumentFile query/listFiles call throw a SecurityException.
+    private var dirRootFile: File? = null
 
     val mimeAny = "*/*"
     val mimePng = "image/png"
@@ -73,15 +108,23 @@ class StorageProvider @Inject constructor(
         }
 
         prefsCore.dirRoot.set(rootUri.toString())
-        resolver.takePersistableUriPermission(rootUri, persistablePermission)
+
+        try {
+            resolver.takePersistableUriPermission(rootUri, persistablePermission)
+        } catch (e: Exception) {
+            Timber.e(e, "Error on taking persistable URI, will rely on direct file access instead")
+        }
 
         dirRoot = DocumentFile.fromTreeUri(context, rootUri)
+        dirRootFile = rootUri.toRealFileOrNull()
     }
 
     init {
         prefsCore.dirRoot.get().let { dir ->
             if (dir.isNotBlank()) {
-                dirRoot = DocumentFile.fromTreeUri(context, Uri.parse(dir))
+                val uri = Uri.parse(dir)
+                dirRoot = DocumentFile.fromTreeUri(context, uri)
+                dirRootFile = uri.toRealFileOrNull()
             }
         }
     }
@@ -95,7 +138,8 @@ class StorageProvider @Inject constructor(
     private val supportFolderName = "support"
 
     val shouldExtractSupportImages
-        get() = dirRoot?.findFile(supportFolderName) == null
+        get() = dirRootFile?.let { !File(it, supportFolderName).isDirectory }
+            ?: (dirRoot?.findFile(supportFolderName) == null)
 
     private val supportImageFolder
         get() = dirRoot.getOrCreateDir(supportFolderName)
@@ -115,6 +159,16 @@ class StorageProvider @Inject constructor(
             SupportImageKind.CE -> supportCEFolder
             SupportImageKind.Friend -> supportFriendFolder
         }
+
+    private val SupportImageKind.folderName
+        get() = when (this) {
+            SupportImageKind.Servant -> "servant"
+            SupportImageKind.CE -> "ce"
+            SupportImageKind.Friend -> "friend"
+        }
+
+    private fun SupportImageKind.realImageFolder(): File? =
+        dirRootFile?.let { File(File(it, supportFolderName), folderName) }
 
     override fun writeSupportImage(kind: SupportImageKind, name: String): OutputStream {
         val folder = kind.imageFolder
@@ -138,6 +192,25 @@ class StorageProvider @Inject constructor(
     }
 
     override fun readSupportImage(kind: SupportImageKind, name: String): List<InputStream> {
+        kind.realImageFolder()?.let { folder ->
+            val target = File(folder, name)
+
+            val files: List<File> = when {
+                target.isDirectory -> target.listFiles()
+                    ?.filter { !it.name.lowercase().contains("nomedia") }
+                    ?.takeUnless { it.isEmpty() }
+                    ?: throw KnownException(KnownException.Reason.SupportFolderIsEmpty(kind, name))
+
+                target.isFile -> listOf(target)
+
+                else -> throw KnownException(
+                    KnownException.Reason.CouldNotOpenSupportFileForReading(kind, name)
+                )
+            }
+
+            return files.map { FileInputStream(it) }
+        }
+
         val file = kind.imageFolder.findFile(name)
             ?: throw KnownException(
                 KnownException.Reason.CouldNotOpenSupportFileForReading(kind, name)
@@ -158,10 +231,19 @@ class StorageProvider @Inject constructor(
         }
     }
 
-    override fun list(kind: SupportImageKind) = kind.imageFolder
-        .listFiles()
-        .mapNotNull { it.name }
-        .filterNot { it.lowercase().contains("nomedia") }
+    override fun list(kind: SupportImageKind): List<String> {
+        kind.realImageFolder()?.let { folder ->
+            return folder.listFiles()
+                ?.mapNotNull { it.name }
+                ?.filterNot { it.lowercase().contains("nomedia") }
+                ?: emptyList()
+        }
+
+        return kind.imageFolder
+            .listFiles()
+            .mapNotNull { it.name }
+            .filterNot { it.lowercase().contains("nomedia") }
+    }
 
     private val dropsFolder
         get() = dirRoot.getOrCreateDir("drops")
